@@ -1,19 +1,12 @@
-package main
+package lossypng
 
 import (
-	"flag"
 	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
 	_ "image/gif" // for image.Decode() format registration
 	_ "image/jpeg"
-	"image/png"
-	"os"
-	"path"
-	"runtime"
-	"strings"
-	"sync"
 )
 
 const (
@@ -23,81 +16,44 @@ const (
 )
 
 const deltaComponents = 4
+
 type colorDelta [deltaComponents]int32 // difference between two colors in rgba
 
-func main() {
-	var convertToRGBA, convertToGrayscale bool
-	var quantization int
-	var extension string
-	flag.BoolVar(&convertToRGBA, "c", false, "convert image to 32-bit color")
-	flag.BoolVar(&convertToGrayscale, "g", false, "convert image to grayscale")
-	flag.IntVar(&quantization, "s", 20, "quantization threshold, zero is lossless")
-	flag.StringVar(&extension, "e", "-lossy.png", "filename extension of output files")
-	flag.Parse()
+func Shrink(img image.Image) image.Image {
+	s := &Shrinker{
+		Quantization: 20,
+	}
+	return s.Shrink(img)
+}
 
+type Shrinker struct {
+	// Convert image to 32-bit color.
+	RGBA bool
+
+	// Convert image to grayscale.
+	Grayscale bool
+
+	// Quantization threshold, zero is lossless.
+	// 20 yields a minimal loss and great size reduction.
+	Quantization int
+}
+
+func (s *Shrinker) Shrink(img image.Image) image.Image {
 	var colorConversion int
-	if convertToRGBA && !convertToGrayscale {
+	if s.RGBA && !s.Grayscale {
 		colorConversion = rgbaConversion
-	} else if convertToGrayscale && !convertToRGBA {
+	} else if s.Grayscale && !s.RGBA {
 		colorConversion = grayscaleConversion
 	}
 
-	allPaths := flag.Args()
-	pathCount := len(allPaths)
-	n := runtime.NumCPU()
-	if n > pathCount {
-		n = pathCount
-	}
-	if n > 1 {
-		runtime.GOMAXPROCS(n)
-	}
-	pathChan := make(chan string)
-	var waiter sync.WaitGroup
-	waiter.Add(n)
-	for i := 0; i < n; i++ {
-		go optimizePaths(pathChan, &waiter, colorConversion, quantization, extension)
-	}
-	for _, path := range flag.Args() {
-		pathChan <- path
-	}
-	close(pathChan)
-	waiter.Wait()
+	return optimize(img, colorConversion, s.Quantization)
 }
 
-func optimizePaths(
-	pathChan <-chan string,
-	waiter *sync.WaitGroup,
+func optimize(
+	decoded image.Image,
 	colorConversion int,
 	quantization int,
-	extension string,
-) {
-	for path := range pathChan {
-		optimizePath(path, colorConversion, quantization, extension)
-	}
-	waiter.Done()
-}
-
-func optimizePath(
-	inPath string,
-	colorConversion int,
-	quantization int,
-	extension string,
-) {
-	// load image
-	inFile, openErr := os.Open(inPath)
-	if openErr != nil {
-		fmt.Printf("couldn't open %v: %v\n", inPath, openErr)
-		return
-	}
-
-	inInfo, inStatErr := inFile.Stat()
-	decoded, _, decodeErr := image.Decode(inFile)
-	inFile.Close()
-	if decodeErr != nil {
-		fmt.Printf("couldn't decode %v: %v\n", inPath, decodeErr)
-		return
-	}
-
+) image.Image {
 	// optimize image, converting colorspace if requested
 	bounds := decoded.Bounds()
 	optimized := decoded // update optimized variable later if color conversion is necessary
@@ -146,62 +102,7 @@ func optimizePath(
 		}
 	}
 
-	// save optimized image
-	outPath := pathWithSuffix(inPath, extension)
-	outFile, createErr := os.Create(outPath)
-	if createErr != nil {
-		fmt.Printf("couldn't create %v: %v\n", outPath, createErr)
-		return
-	}
-
-	encodeErr := png.Encode(outFile, optimized)
-	outInfo, outStatErr := outFile.Stat()
-	outFile.Close()
-	if encodeErr != nil {
-		fmt.Printf("couldn't encode %v: %v\n", inPath, encodeErr)
-		return
-	}
-
-	// print compression statistics
-	var inSize, outSize int64
-	var inSizeDesc, outSizeDesc, percentage string
-	if inStatErr != nil {
-		inSizeDesc = "???B"
-	} else {
-		inSize = inInfo.Size()
-		inSizeDesc = sizeDesc(inSize)
-	}
-	if outStatErr != nil {
-		outSizeDesc = "???B"
-	} else {
-		outSize = outInfo.Size()
-		outSizeDesc = sizeDesc(outSize)
-	}
-	if inStatErr != nil || outStatErr != nil {
-		percentage = "???%"
-	} else {
-		percentage = fmt.Sprintf("%d%%", (outSize*100+inSize/2)/inSize)
-	}
-	fmt.Printf(
-		"compressed %s (%s) to %s (%s, %s)\n",
-		path.Base(inPath),
-		inSizeDesc,
-		path.Base(outPath),
-		outSizeDesc,
-		percentage,
-	)
-}
-
-func pathWithSuffix(filePath string, suffix string) string {
-	extension := path.Ext(filePath)
-	insertion := len(extension)
-	if insertion > 0 {
-		// if extension exists, trim it off of the base filename
-		insertion = strings.LastIndex(filePath, extension)
-	} else {
-		insertion = len(filePath)
-	}
-	return filePath[:insertion] + suffix
+	return optimized
 }
 
 func optimizeForAverageFilter(
@@ -225,12 +126,12 @@ func optimizeForAverageFilter(
 	const filterCenter = 2
 	var colorError [errorRowCount][]colorDelta
 	for i := 0; i < errorRowCount; i++ {
-		colorError[i] = make([]colorDelta, width + filterWidth - 1)
+		colorError[i] = make([]colorDelta, width+filterWidth-1)
 	}
 
 	for y := 0; y < height; y++ {
 		for x := 0; x < width; x++ {
-			diffusion := diffuseColorDeltas(colorError, x + filterCenter)
+			diffusion := diffuseColorDeltas(colorError, x+filterCenter)
 			for c := 0; c < bytesPerPixel; c++ {
 				offset := y*stride + x*bytesPerPixel + c
 				here := int32(pixels[offset])
@@ -254,11 +155,11 @@ func optimizeForAverageFilter(
 						errorHere = here - newValue
 					}
 				}
-				colorError[0][x + filterCenter][c] = errorHere
+				colorError[0][x+filterCenter][c] = errorHere
 			}
 		}
 		for i := 0; i < errorRowCount; i++ {
-			colorError[(i+1) % errorRowCount] = colorError[i]
+			colorError[(i+1)%errorRowCount] = colorError[i]
 		}
 	}
 }
@@ -283,12 +184,12 @@ func optimizeForPaethFilter(
 	const filterCenter = 2
 	var colorError [errorRowCount][]colorDelta
 	for i := 0; i < errorRowCount; i++ {
-		colorError[i] = make([]colorDelta, width + filterWidth - 1)
+		colorError[i] = make([]colorDelta, width+filterWidth-1)
 	}
 
 	for y := 0; y < height; y++ {
 		for x := 0; x < width; x++ {
-			diffusion := diffuseColorDeltas(colorError, x + filterCenter)
+			diffusion := diffuseColorDeltas(colorError, x+filterCenter)
 
 			offset := y*stride + x
 			here := pixels[offset]
@@ -307,7 +208,7 @@ func optimizeForPaethFilter(
 			bestDelta := colorDifference(palette[here], palette[paeth])
 			total := bestDelta.add(diffusion)
 			var bestColor uint8
-			if (total.magnitude() >> 16) < uint64(quantization * quantization) {
+			if (total.magnitude() >> 16) < uint64(quantization*quantization) {
 				bestColor = paeth
 			} else {
 				bestDelta = colorDifference(palette[here], palette[bestColor])
@@ -325,10 +226,10 @@ func optimizeForPaethFilter(
 				}
 			}
 			pixels[offset] = bestColor
-			colorError[0][x + filterCenter] = bestDelta
+			colorError[0][x+filterCenter] = bestDelta
 		}
 		for i := 0; i < errorRowCount; i++ {
-			colorError[(i+1) % errorRowCount] = colorError[i]
+			colorError[(i+1)%errorRowCount] = colorError[i]
 		}
 	}
 }
@@ -387,14 +288,14 @@ func colorDifference(a, b color.Color) colorDelta {
 
 	redMean := int32((redA + redB) / 2)
 	return colorDelta{
-		int32((2*full+redMean)*delta[0] / (3 * full)),
-		int32(4*delta[1] / 3),
-		int32((3*full-redMean)*delta[2] / (3 * full)),
+		int32((2*full + redMean) * delta[0] / (3 * full)),
+		int32(4 * delta[1] / 3),
+		int32((3*full - redMean) * delta[2] / (3 * full)),
 		int32(delta[3]),
 	}
 }
 
-func (delta colorDelta)magnitude() uint64 {
+func (delta colorDelta) magnitude() uint64 {
 	var d2 uint64
 	for i := 0; i < deltaComponents; i++ {
 		d2 += uint64(int64(delta[i]) * int64(delta[i]))
@@ -403,7 +304,7 @@ func (delta colorDelta)magnitude() uint64 {
 	return d2
 }
 
-func (a colorDelta)add(b colorDelta) colorDelta {
+func (a colorDelta) add(b colorDelta) colorDelta {
 	var delta colorDelta
 	for i := 0; i < deltaComponents; i++ {
 		delta[i] = a[i] + b[i]
